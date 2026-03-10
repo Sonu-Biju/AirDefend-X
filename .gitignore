@@ -1,0 +1,12 @@
+# Python environment
+venv311/
+__pycache__/
+*.pyc
+
+# Security
+keys/
+
+# Data and Results
+data/opensky.csv
+benchmark_results.csv
+benchmark_results.png
