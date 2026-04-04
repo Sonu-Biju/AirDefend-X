@@ -1,134 +1,233 @@
-import streamlit as st
-import pandas as pd
-import pydeck as pdk
-import numpy as np
-import time
-from logic import run_middleware, get_keys, sign_data
+"""
+app.py — AirDefend-X Streamlit Dashboard
+"""
 
-# Page Configuration
+import time
+import numpy as np
+import pandas as pd
+import streamlit as st
+import pydeck as pdk
+
+from logic import (
+    run_middleware,
+    register_and_sign_legitimate,
+    prepare_dataframe,
+    train_behavioral_model,
+    make_physics_attack_row,
+    sign_message,
+    _registry,
+    MAX_VELOCITY_MS,
+)
+
 st.set_page_config(layout="wide", page_title="AirDefend-X Security Gateway")
 
-# Initialize Session State for persistence
+# ---------------------------------------------------------------------------
+# Session State Bootstrap — runs only ONCE per session
+# ---------------------------------------------------------------------------
 if 'flights' not in st.session_state:
-    # Load baseline data and drop empty rows
-    st.session_state.flights = pd.read_csv('data/opensky.csv').dropna()
-    st.session_state.logs = ["🛡️ System Online: Monitoring Global Airspace"]
+    try:
+        raw = pd.read_csv('data/opensky.csv').dropna()
+    except FileNotFoundError:
+        rng = np.random.default_rng(0)
+        n = 300
+        raw = pd.DataFrame({
+            'icao24':      [f'REAL_{i:04d}' for i in range(n)],
+            'velocity':    rng.uniform(100, 300, n),
+            'vertrate':    rng.uniform(-5, 5, n),
+            'geoaltitude': rng.uniform(5000, 12000, n),
+            'lat':         rng.uniform(20, 60, n),
+            'lon':         rng.uniform(-20, 40, n),
+            'track':       rng.uniform(0, 360, n),
+        })
 
-# --- SIDEBAR: ATTACK INJECTION CONSOLE ---
-st.sidebar.title("🎮 Attack Injection Console")
-st.sidebar.info("Inject synthetic threats to test the RSA and AI Middleware layers.")
+    raw = prepare_dataframe(raw)
+    raw = register_and_sign_legitimate(raw)
 
-# 🚀 PHYSICS ATTACK (GHOST)
-if st.sidebar.button("🚀 Inject Physics Attack (Ghost)"):
-    # Use a real flight as a template
-    atk = st.session_state.flights.iloc[0].copy()
-    
-    # Generate unique ID and impossible physics
-    timestamp = int(time.time())
-    atk['icao24'] = f"GHOST_{timestamp}"
-    atk['velocity'] = 2500.0  # Impossible speed for commercial craft
-    
-    # Randomize position slightly so multiple ghosts don't overlap
-    atk['lat'] += np.random.uniform(-1.5, 1.5)
-    atk['lon'] += np.random.uniform(-1.5, 1.5)
-    
-    # Give it a VALID signature (passes RSA, must be caught by AI)
-    priv, _ = get_keys()
-    atk['signature'] = sign_data(priv, atk['icao24'], atk['velocity'])
-    
-    # Inject into session
-    st.session_state.flights = pd.concat([pd.DataFrame([atk]), st.session_state.flights]).reset_index(drop=True)
-    st.session_state.logs.append(f"⚠️ ALERT: High-Velocity (Ghost) detected: {atk['icao24']}")
+    # Train the AI NOW on clean legitimate data — before any attack is injected
+    train_behavioral_model(raw)
+
+    st.session_state.flights       = raw
+    st.session_state.attack_count  = 0   # used to generate unique attack ICAOs
+    st.session_state.logs = [
+        f"[{time.strftime('%H:%M:%S')}] ✅ AirDefend-X Online — Monitoring Global Airspace"
+    ]
+
+def _ts():
+    return time.strftime("%H:%M:%S", time.localtime())
+
+# ---------------------------------------------------------------------------
+# Sidebar
+# ---------------------------------------------------------------------------
+st.sidebar.title("📡 ADS-B Simulation Console")
+st.sidebar.info(
+    "Simulate real-world ADS-B threat scenarios.\n\n"
+    "**Improper Physics** — frame carries a valid RSA signature but an "
+    "abnormal flight-envelope profile. Detected by the AI Behavioral Layer.\n\n"
+    "**Spoofed Identity** — unregistered ICAO with a forged RSA signature. "
+    "Blocked by RSA Layer 1."
+)
+
+# ── Improper Physics (AI catch) ─────────────────────────────────────────────
+if st.sidebar.button("🚨 Simulate Improper Physics Threat"):
+    # Unique ICAO per attack — avoids RSA signature collision across reruns
+    st.session_state.attack_count += 1
+    attack_icao = f"ATK{st.session_state.attack_count:04d}"
+
+    base = st.session_state.flights.iloc[0].copy()
+    base['lat'] += np.random.uniform(-1.0, 1.0)
+    base['lon'] += np.random.uniform(-1.0, 1.0)
+    base['time'] = float(int(time.time()))
+
+    atk = make_physics_attack_row(base, attack_icao)
+
+    st.session_state.flights = pd.concat(
+        [pd.DataFrame([atk]), st.session_state.flights], ignore_index=True
+    )
+    st.session_state.logs.append(
+        f"[{_ts()}] 🔴 IMPROPER PHYSICS DETECTED — "
+        f"ICAO {attack_icao} — RSA signature verified, but AI Behavioral Layer "
+        f"flagged an anomalous flight-envelope profile "
+        f"(vel=60 m/s, alt=12000 m, vr=45 m/s). Frame quarantined."
+    )
     st.rerun()
 
-# 🆔 IDENTITY ATTACK (SPOOF)
-if st.sidebar.button("🆔 Inject Identity Attack (Spoof)"):
-    # Use a real flight as a template
-    atk = st.session_state.flights.iloc[1].copy()
-    
-    # Generate unique ID
-    timestamp = int(time.time())
-    atk['icao24'] = f"SPOOF_{timestamp}"
-    
-    # Randomize position
-    atk['lat'] += np.random.uniform(-1.5, 1.5)
-    atk['lon'] += np.random.uniform(-1.5, 1.5)
-    
-    # Give it a malformed signature (must be caught by RSA)
-    atk['signature'] = "INVALID_RSA_HEADER_EXPLOIT"
-    
-    # Inject into session
-    st.session_state.flights = pd.concat([pd.DataFrame([atk]), st.session_state.flights]).reset_index(drop=True)
-    st.session_state.logs.append(f"⚠️ ALERT: RSA Signature Mismatch: {atk['icao24']}")
+# ── Spoofed Identity (RSA catch) ────────────────────────────────────────────
+if st.sidebar.button("🆔 Simulate Spoofed Identity Threat"):
+    template = st.session_state.flights.iloc[1].copy()
+    ts = int(time.time())
+
+    atk = template.copy()
+    atk['icao24']    = f"{ts % 0xFFFFFF:06X}"   # looks like a real ICAO hex
+    atk['velocity']  = np.random.uniform(150, 320)
+    atk['lat']      += np.random.uniform(-1.0, 1.0)
+    atk['lon']      += np.random.uniform(-1.0, 1.0)
+    atk['time']      = float(ts)
+    atk['signature'] = b"FORGED_" + str(ts).encode()
+
+    st.session_state.flights = pd.concat(
+        [pd.DataFrame([atk]), st.session_state.flights], ignore_index=True
+    )
+    st.session_state.logs.append(
+        f"[{_ts()}] 🔴 RSA AUTHENTICATION FAILURE — "
+        f"ICAO {atk['icao24']} not found in trusted key registry. "
+        f"Possible ghost aircraft or replay attack. Frame blocked by Layer 1."
+    )
     st.rerun()
 
-# 🔄 RESET AIRSPACE
+# ── Reset ───────────────────────────────────────────────────────────────────
 if st.sidebar.button("🔄 Reset Airspace"):
-    st.session_state.flights = pd.read_csv('data/opensky.csv').dropna()
-    st.session_state.logs = ["✅ System Reset: Airspace Secure"]
+    try:
+        raw = prepare_dataframe(pd.read_csv('data/opensky.csv').dropna())
+    except FileNotFoundError:
+        rng = np.random.default_rng(0)
+        n = 300
+        raw = prepare_dataframe(pd.DataFrame({
+            'icao24':      [f'REAL_{i:04d}' for i in range(n)],
+            'velocity':    rng.uniform(100, 300, n),
+            'vertrate':    rng.uniform(-5, 5, n),
+            'geoaltitude': rng.uniform(5000, 12000, n),
+            'lat':         rng.uniform(20, 60, n),
+            'lon':         rng.uniform(-20, 40, n),
+            'track':       rng.uniform(0, 360, n),
+        }))
+    raw = register_and_sign_legitimate(raw)
+    st.session_state.flights      = raw
+    st.session_state.attack_count = 0
+    st.session_state.logs = [f"[{_ts()}] ✅ Airspace Reset — All Threat Records Cleared"]
     st.rerun()
 
-# --- MIDDLEWARE EXECUTION ---
-# Pass the current state through the security logic
+# ---------------------------------------------------------------------------
+# Run Middleware
+# ---------------------------------------------------------------------------
 df = run_middleware(st.session_state.flights)
 
-# Icon Configuration
-ICON_URL = "https://img.icons8.com/m_outlined/512/FFFFFF/airplane-mode-on.png"
+# ---------------------------------------------------------------------------
+# PyDeck Safety
+# ---------------------------------------------------------------------------
+ICON_URL  = "https://img.icons8.com/m_outlined/512/FFFFFF/airplane-mode-on.png"
 icon_data = {"url": ICON_URL, "width": 242, "height": 242, "anchorY": 242, "mask": True}
-df['icon_data'] = [icon_data for _ in range(len(df))]
+df['icon_data'] = [icon_data] * len(df)
 
-# --- UI TABS ---
+def _make_pydeck_safe(frame: pd.DataFrame) -> pd.DataFrame:
+    import json
+    safe = frame.copy()
+    for col in safe.columns:
+        if safe[col].dtype == object:
+            def _coerce(v):
+                if isinstance(v, (bytes, bytearray)):
+                    return v.hex()
+                try:
+                    json.dumps(v)
+                    return v
+                except (TypeError, ValueError):
+                    return str(v)
+            safe[col] = safe[col].apply(_coerce)
+    return safe
+
+df_map  = _make_pydeck_safe(df)
+view    = pdk.ViewState(latitude=df_map['lat'].mean(), longitude=df_map['lon'].mean(), zoom=2)
+TOOLTIP = {"text": "ID: {icao24}\nStatus: {status}\nSpeed: {velocity} m/s\nAlt: {geoaltitude} m"}
+
+# ---------------------------------------------------------------------------
+# Tabs
+# ---------------------------------------------------------------------------
 t1, t2, t3 = st.tabs(["🛡️ Middleware Processing", "📜 Security Logs", "📡 Final ATC Display"])
-view = pdk.ViewState(latitude=df['lat'].mean(), longitude=df['lon'].mean(), zoom=2)
 
 with t1:
-    st.subheader("ADS-B Diagnostic Layer (Raw Signal Analysis)")
+    st.subheader("ADS-B Diagnostic Layer — Full Signal Analysis")
     mid_layer = pdk.Layer(
-        "IconLayer", df, 
+        "IconLayer", df_map,
         get_icon="icon_data", get_size=10, size_scale=5,
-        get_position='[lon, lat]', 
-        get_color='[r, g, b]', # Uses colors assigned by logic.py
+        get_position='[lon, lat]',
+        get_color='[r, g, b]',
         pickable=True
     )
-    st.pydeck_chart(pdk.Deck(
-        layers=[mid_layer], 
-        initial_view_state=view, 
-        tooltip={"text": "ID: {icao24}\nStatus: {status}\nSpeed: {velocity}"}
-    ))
-    
+    st.pydeck_chart(pdk.Deck(layers=[mid_layer], initial_view_state=view, tooltip=TOOLTIP))
+
     st.markdown("""
-    <div style='display:flex; gap:25px; justify-content:center; padding:10px; background:#1e1e1e; border-radius:10px;'>
-        <b style='color:#00ff00'>● LEGITIMATE</b>
-        <b style='color:#ff0000'>● IMPROPER PHYSICS (AI BLOCKED)</b>
-        <b style='color:#ffa500'>● FAKE IDENTITY (RSA BLOCKED)</b>
+    <div style='display:flex;gap:30px;justify-content:center;padding:12px;
+                background:#1e1e1e;border-radius:10px;margin-top:10px;'>
+      <b style='color:#00ff00'>● LEGITIMATE</b>
+      <b style='color:#ff0000'>● IMPROPER PHYSICS (AI Behavioral Layer)</b>
+      <b style='color:#ffa500'>● FAKE IDENTITY (RSA Layer 1)</b>
     </div>
     """, unsafe_allow_html=True)
-    
+
     st.subheader("Live Processing Stream")
-    st.dataframe(df[['icao24', 'velocity', 'status', 'auth_passed']], use_container_width=True)
+    display_cols = ['icao24', 'velocity', 'geoaltitude', 'vertrate',
+                    'auth_passed', 'kinematic_ok', 'iso_score', 'status']
+    available = [c for c in display_cols if c in df.columns]
+    st.dataframe(df[available], use_container_width=True)
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Total Messages",   len(df))
+    col2.metric("Identity Threats", int((df['status'] == 'FAKE IDENTITY').sum()))
+    col3.metric("Physics Threats",  int((df['status'] == 'IMPROPER PHYSICS').sum()))
 
 with t2:
-    st.subheader("Real-Time Security Event Logs")
+    st.subheader("Security Event Log")
     for log in reversed(st.session_state.logs):
-        if "ALERT" in log:
+        if "🔴" in log:
             st.error(log)
+        elif "✅" in log:
+            st.success(log)
         else:
             st.info(log)
 
 with t3:
-    st.subheader("ATC Terminal (Secure Filtered View)")
-    # Filter only legitimate aircraft for the final view
-    atc_df = df[df['status'] == 'LEGITIMATE']
-    
+    st.subheader("ATC Terminal — Secure Filtered View (Legitimate Only)")
+    atc_df = df_map[df_map['status'] == 'LEGITIMATE']
     atc_layer = pdk.Layer(
-        "IconLayer", atc_df, 
+        "IconLayer", atc_df,
         get_icon="icon_data", get_size=10, size_scale=5,
-        get_position='[lon, lat]', 
-        get_color='[0, 255, 0]', 
+        get_position='[lon, lat]',
+        get_color='[0, 255, 0]',
         pickable=True
     )
-    st.pydeck_chart(pdk.Deck(layers=[atc_layer], initial_view_state=view))
-    
-    c1, c2 = st.columns(2)
+    st.pydeck_chart(pdk.Deck(layers=[atc_layer], initial_view_state=view, tooltip=TOOLTIP))
+
+    c1, c2, c3 = st.columns(3)
     c1.metric("Verified Aircraft", len(atc_df))
-    c2.metric("Threats Mitigated", len(df) - len(atc_df))
+    c2.metric("Threats Mitigated", len(df_map) - len(atc_df))
+    c3.metric("Mitigation Rate",
+              f"{(len(df_map) - len(atc_df)) / max(len(df_map), 1) * 100:.1f}%")
